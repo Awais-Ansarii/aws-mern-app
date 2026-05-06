@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { URL_PROD } from "../constants";
 
 export default function ImageGallery() {
   const fileInputRef = useRef();
@@ -9,7 +10,8 @@ export default function ImageGallery() {
   // 📥 Fetch images
   const fetchImages = async () => {
     try {
-      const res = await fetch("http://localhost:5000/api/images");
+      
+      const res = await fetch(`${URL_PROD}/api/images`);
       const data = await res.json();
       setImages(data);
     } catch (err) {
@@ -33,7 +35,7 @@ export default function ImageGallery() {
     try {
       setLoading(true);
 
-      await fetch("http://localhost:5000/api/upload", {
+      await fetch(`${URL_PROD}/api/upload`, {
         method: "POST",
         body: formData
       });
@@ -51,7 +53,7 @@ export default function ImageGallery() {
   // ❌ Delete
   const handleDelete = async (id) => {
     try {
-      await fetch(`http://localhost:5000/api/image/${id}`, {
+      await fetch(`${URL_PROD}/api/image/${id}`, {
         method: "DELETE"
       });
 
