@@ -67,7 +67,7 @@ export default function ImageGallery() {
     <div className="min-h-screen bg-gray-100 p-6">
       <div className="max-w-5xl mx-auto">
         
-        <h2 className="text-2xl font-bold mb-6">📸 S3 Image Gallery</h2>
+        <h2 className="text-2xl font-bold mb-6">My Image Gallery</h2>
 
         {/* Upload */}
         <form
