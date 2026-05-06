@@ -1,0 +1,207 @@
+name: Deploy MERN App
+
+on:
+    
+  push:
+    branches:
+      - main
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 1: Deploy Backend (Node.js + PM2)
+  # - Runs on GitHub Actions runner (ubuntu-latest, Node 22)
+  # - SSHs into EC2 and restarts the backend via PM2
+  # - Skips npm ci if server/package.json hasn't changed
+  # ═══════════════════════════════════════════════════════════════
+  deploy-server:
+    name: Deploy Server (Node + PM2)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Checkout repo on the runner ──────────────────
+      # fetch-depth: 2 is required so we can run git diff HEAD~1
+      # to detect which files changed in the latest push
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ── Step 2: Setup Node 22 on the GitHub Actions runner ───
+      # EC2 uses nvm to manage Node (handled inside SSH script)
+      # The runner needs Node too for any future CI steps (lint, test, etc.)
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # ── Step 3: Detect if server deps changed ────────────────
+      # Compares current commit vs previous commit file list.
+      # Sets output variable `changed=true/false` used in SSH script.
+      # This avoids running npm ci on every push (saves ~30-60s).
+      - name: Check if server/package.json changed
+        id: server-deps
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q '^server/package'; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Step 4: SSH into EC2 and deploy backend ──────────────
+      # Passes SERVER_DEPS_CHANGED env var into the remote script
+      # so EC2 knows whether to run npm ci or skip it.
+      - name: Deploy server to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          envs: SERVER_DEPS_CHANGED
+          script: |
+            # Exit immediately if any command fails
+            set -e
+
+            echo "📦 Moving to project root"
+            cd ~/aws-mern-app
+
+            echo "⬇️  Pulling latest code from main"
+            git pull origin main
+
+            echo "🧠 Backend setup"
+            cd server
+
+            # Only install deps if package.json changed in this push
+            # SERVER_DEPS_CHANGED is passed from the runner via `envs:`
+            if [ "$SERVER_DEPS_CHANGED" = "true" ]; then
+              echo "   package.json changed → running npm ci"
+              npm ci
+            else
+              echo "   No package change → skipping npm ci"
+            fi
+
+            # Restart existing PM2 process, or start fresh if not running
+            echo "   Restarting PM2 backend process"
+            pm2 restart backend 2>/dev/null || pm2 start index.js --name backend
+
+            echo "✅ Server job complete"
+        env:
+          SERVER_DEPS_CHANGED: ${{ steps.server-deps.outputs.changed }}
+
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 2: Deploy Frontend (React build + Nginx reload)
+  # - Runs ONLY after deploy-server succeeds (needs: deploy-server)
+  # - Skips npm ci if client/package.json hasn't changed
+  # - Backs up existing dist before building
+  # - Rolls back to dist_prev if build fails, then exits with code 1
+  #   so GitHub marks the job as failed (not silently green)
+  # ═══════════════════════════════════════════════════════════════
+  deploy-client:
+    name: Deploy Client (React build + Nginx)
+    runs-on: ubuntu-latest
+    needs: deploy-server  # Waits for server job to pass before starting
+
+    steps:
+      # ── Step 1: Checkout repo on the runner ──────────────────
+      # fetch-depth: 2 needed for git diff check (same as server job)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ── Step 2: Setup Node 22 on the GitHub Actions runner ───
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # ── Step 3: Detect if client deps changed ────────────────
+      # Same logic as server job — avoids unnecessary npm ci runs
+      - name: Check if client/package.json changed
+        id: client-deps
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q '^client/package'; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Step 4: SSH into EC2, build frontend, reload Nginx ───
+      # Full flow:
+      #   1. Optionally run npm ci (if deps changed)
+      #   2. Backup current dist → dist_prev
+      #   3. Delete old dist
+      #   4. Run npm run build
+      #      → Success: reload nginx, clean up dist_prev
+      #      → Failure: restore dist_prev, reload nginx, exit 1
+      - name: Build client and reload Nginx on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          envs: CLIENT_DEPS_CHANGED
+          script: |
+            set -e
+
+            echo "🎨 Moving to client directory"
+            cd ~/aws-mern-app/client
+
+            # Only install deps if package.json changed in this push
+            if [ "$CLIENT_DEPS_CHANGED" = "true" ]; then
+              echo "   package.json changed → running npm ci"
+              npm ci
+            else
+              echo "   No package change → skipping npm ci"
+            fi
+
+            # ── Backup current dist before touching anything ───
+            # If dist exists, copy it to dist_prev as a rollback snapshot.
+            # We use cp -r (not mv) so dist_prev is always a clean copy.
+            if [ -d dist ]; then
+              echo "💾 Backing up current dist → dist_prev"
+              rm -rf dist_prev          # remove any stale backup first
+              cp -r dist dist_prev
+              echo "🗑️  Removing old dist"
+              rm -rf dist
+            fi
+
+            # ── Build ──────────────────────────────────────────
+            # We use `if/else` instead of `set -e` stopping on failure
+            # so we can handle the failure gracefully (rollback).
+            # The outer `set -e` is intentionally bypassed here via if/else.
+            echo "🔨 Running npm run build..."
+            if npm run build; then
+
+              # Build succeeded
+              echo "✅ Build succeeded"
+
+              echo "🌐 Reloading Nginx to serve new build"
+              sudo systemctl reload nginx
+
+              
+              echo "🎉 Client deploy complete"
+
+            else
+
+              # Build failed → rollback to previous dist
+              echo "❌ Build FAILED — initiating rollback"
+
+              if [ -d dist_prev ]; then
+                echo "⏪ Restoring dist_prev → dist"
+                cp -r dist_prev dist
+                echo "🌐 Reloading Nginx with previous build"
+                sudo systemctl reload nginx
+                echo "⚠️  Rollback complete — previous build is live"
+              else
+                # No backup available (e.g. very first deploy ever)
+                echo "⚠️  No dist_prev found — Nginx may be serving nothing"
+              fi
+
+              # Exit with code 1 so GitHub marks this job as FAILED
+              # Without this, the job would appear green despite rollback
+              exit 1
+
+            fi
+        env:
+          CLIENT_DEPS_CHANGED: ${{ steps.client-deps.outputs.changed }}
